@@ -1,19 +1,4 @@
 ﻿
-// car = head
-// cdr = tail
-
-let head = List.head
-let tail = List.tail
-let cons (x, y) = x :: y
-
-(*
-let b =
-  [a(tail(x)) , []
-   a(tail(tail(x))), cons(head(x), [])
-   a(tail(tail(tail(x)))), cons(head(x), cons(head(tail(x)), []))
-   T, cons(car(x), cons(head(tail(x)), cons(head(tail(tail(x))), [])))]
-*)
-
 type sexp =
   | Atom of string
   | Exp of sexp * sexp
@@ -24,6 +9,7 @@ type program =
   | Head of program
   | Tail of program
   | X
+  | ReturnNil
 
 let parse_old_sexp (s : string) =
   let cs = s.ToCharArray()
@@ -40,20 +26,22 @@ let parse_old_sexp (s : string) =
     if cs.[i] = ')' then i + 1
     else failwith "expected close paren"
   let rec parse_sexp i : sexp * int =
-    match cs.[i] with
-    | '(' ->
-      let i = skip_whitespace (i + 1)
-      let a, i = parse_sexp i
-      let i = skip_whitespace i
-      let b, i = parse_sexp i
-      let i = skip_whitespace i
-      let i = close_paren i
-      Exp(a, b), i
-    | ')' -> failwith "unexpected close paren"
-    | ' ' -> parse_sexp (i + 1)
-    | _ ->
-      let end_index = parse_word i
-      Atom (cs.[i..end_index-1] |> System.String), end_index
+    if i>=cs.Length then Nil, i
+    else
+      match cs.[i] with
+      | '(' ->
+        let i = skip_whitespace (i + 1)
+        let a, i = parse_sexp i
+        let i = skip_whitespace i
+        let b, i = parse_sexp i
+        let i = skip_whitespace i
+        let i = close_paren i
+        Exp(a, b), i
+      | ')' -> failwith "unexpected close paren"
+      | ' ' -> parse_sexp (i + 1)
+      | _ ->
+        let end_index = parse_word i
+        Atom (cs.[i..end_index-1] |> System.String), end_index
   parse_sexp 0 |> fst
 
 let parse_modern_sexp (s : string) =
@@ -99,14 +87,23 @@ let rec print_program p =
   | Head a -> sprintf "head(%s)" (print_program a)
   | Tail a -> sprintf "tail(%s)" (print_program a)
   | X -> "X"
+  | ReturnNil -> "Nil"
 
 let examples =
-  [
-    "a",        "a"     // (a(tail(tail(c)) -> []
+  [|
+    "a",        "a"
     "(a b)",      "(b a)"
     "(a (b c))",    "(c (b a))"
     "(a (b (c d)))",  "(d (c (b a)))"
-  ] //TODO |> List.map to_example
+  |]
+
+let examples2 =
+  [|
+    "a",        ""
+    "(a b)",      "a"
+    "(a (b c))",    "(a b)"
+    "(a (b (c d)))",  "(a (b c))"
+  |]
 
 let enumerate_sexps sexp =
   let rec enumerate sexp bf = seq {
@@ -121,7 +118,7 @@ let enumerate_sexps sexp =
   enumerate sexp X |> Seq.toArray
   
 let construct_fragment input output =
-  let subexprs = enumerate_sexps input |> Map.ofSeq
+  let subexprs = Seq.append [Nil, ReturnNil] (enumerate_sexps input) |> Map.ofSeq
   let rec construct sexp =
     if subexprs.ContainsKey sexp then subexprs.[sexp]
     else
@@ -130,21 +127,72 @@ let construct_fragment input output =
       | Atom s -> failwith "Found unexpected symbol"
       | Nil -> failwith "Nil not supported"
   construct output
-  
+
+let predicate_generation i0 i1 =
+  let rec pg i0 i1 f =
+    match i0, i1 with
+    | _, Atom _ -> None
+    | Atom _, _ -> Some f
+    | Exp(head0, tail0), Exp(head1, tail1) ->
+      let p = pg head0 head1 (Head f)
+      if p.IsSome then p
+      else pg tail0 tail1 (Tail f)
+    | _ -> failwith "unsupported case"
+  pg i0 i1 X
+
+let find_recurrence p0 p1 =
+  let rec enumerate p = seq {
+    yield p
+    match p with
+    | Cons(a, b) ->
+        yield! enumerate a
+        yield! enumerate b
+    | Head a -> yield! enumerate a
+    | Tail a -> yield! enumerate a
+    | _ -> ()
+  }
+  let rec replace_x p sub =
+    match p with
+    | Cons(a, b) -> Cons(replace_x a sub, replace_x b sub)
+    | Head a -> Head(replace_x a sub)
+    | Tail a -> Tail(replace_x a sub)
+    | X -> sub
+    | ReturnNil -> ReturnNil
+  let subs = enumerate p1 |> Set.ofSeq
+  let replaced = subs |> Seq.map (fun sub -> replace_x p0 sub) |> Seq.toArray
+  subs
+  |> Seq.map (fun sub -> replace_x p0 sub, sub)
+  |> Seq.filter (fun (p, _) -> p = p1)
+  |> Seq.tryHead
+
 let do_thing () =
-  let parse (a, b) =
-    (parse_old_sexp a), (parse_old_sexp b)
-  let construct (a, b) =
-    let program = construct_fragment a b
-    a, b, program
-  let print (a, b, program) =
+  // Calculate the program fragments
+  let print ((a, b), predicate, program) =
     let a, b = print_sexp a, print_sexp b
     let program = print_program program
-    sprintf "input: %s\noutput: %s\nprogram: %s" a b program
-  examples
-  |> Seq.map (parse >> construct >> print)
-  |> String.concat "\n\n"
-                
+    let predicate = defaultArg (Option.map print_program predicate) "default"
+    sprintf "input: %s\noutput: %s\npredicate: %s\nprogram: %s" a b predicate program
+  // Do all the stuff
+  let examples =
+    examples2 |> Array.map (fun (a, b) -> parse_old_sexp a, parse_old_sexp b)
+  let predicates =
+    let ps =
+      examples
+      |> Seq.map fst
+      |> Seq.pairwise
+      |> Seq.map (fun (i0, i1) -> predicate_generation i0 i1)
+    Seq.append ps [None]
+  let traces = examples |> Seq.map (fun (a, b) -> construct_fragment a b)
+  // Return as printed string
+  let v =
+    Seq.zip3 examples predicates traces
+    |> Seq.map print
+    |> String.concat "\n\n"
+  // ################
+  traces
+    |> Seq.pairwise
+    |> Seq.map (fun (a, b) -> find_recurrence a b)
+    |> Array.ofSeq
 
 [<EntryPoint>]
 let main argv =
