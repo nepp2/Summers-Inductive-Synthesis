@@ -8,6 +8,7 @@ type program =
   | Cons of program * program
   | Head of program
   | Tail of program
+  | F of program
   | X
   | ReturnNil
 
@@ -41,7 +42,9 @@ let parse_old_sexp (s : string) =
       | ' ' -> parse_sexp (i + 1)
       | _ ->
         let end_index = parse_word i
-        Atom (cs.[i..end_index-1] |> System.String), end_index
+        let word = (cs.[i..end_index-1] |> System.String)
+        if word = "NIL" then Nil, end_index
+        else Atom word, end_index
   parse_sexp 0 |> fst
 
 let parse_modern_sexp (s : string) =
@@ -86,17 +89,17 @@ let rec print_program p =
   | Cons(a, b) -> sprintf "cons(%s, %s)" (print_program a) (print_program b)
   | Head a -> sprintf "head(%s)" (print_program a)
   | Tail a -> sprintf "tail(%s)" (print_program a)
+  | F a -> sprintf "F(%s)" (print_program a)
   | X -> "X"
   | ReturnNil -> "Nil"
 
 let examples =
   [|
-    "a",        "a"
-    "(a b)",      "(b a)"
-    "(a (b c))",    "(c (b a))"
-    "(a (b (c d)))",  "(d (c (b a)))"
+    "NIL",        "NIL"
+    "(a (b NIL))",      "(b NIL)"
+    "((a (b NIL)) ((c (d NIL)) NIL))",    "(b (d NIL))"
+    "((a (b NIL)) ((c (d NIL)) ((e (f NIL)) NIL)))",  "(b (d (e NIL)))"
   |]
-
 let examples2 =
   [|
     "a",        ""
@@ -131,7 +134,9 @@ let construct_fragment input output =
 let predicate_generation i0 i1 =
   let rec pg i0 i1 f =
     match i0, i1 with
+    | _, Nil -> None
     | _, Atom _ -> None
+    | Nil, _ -> Some f
     | Atom _, _ -> Some f
     | Exp(head0, tail0), Exp(head1, tail1) ->
       let p = pg head0 head1 (Head f)
@@ -139,6 +144,35 @@ let predicate_generation i0 i1 =
       else pg tail0 tail1 (Tail f)
     | _ -> failwith "unsupported case"
   pg i0 i1 X
+
+let find_recurrence2 p0 p1 =
+  let rec match_until_x a b = seq {
+    match a, b with
+    | Cons(ah, at), Cons(bh, bt) ->
+        yield! match_until_x ah bh
+        yield! match_until_x at bt
+    | Head ah, Head bh ->
+        yield! match_until_x ah bh
+    | Tail at, Tail bt ->
+        yield! match_until_x at bt
+    | X, _ -> yield b
+    | _ -> if a <> b then yield ReturnNil
+  }
+  let rec find_matching_subexprs a b = seq {
+    let matches = match_until_x a b |> Array.ofSeq
+    let matches = matches |> Seq.distinct |> Array.ofSeq
+    if matches.Length = 1 then
+      let h = Array.head matches
+      if h <> ReturnNil then yield F(h)
+    match b with
+    | Cons(bh, bt) ->
+        yield! find_matching_subexprs a bh |> Seq.map (fun p -> Cons(p, bt))
+        yield! find_matching_subexprs a bt |> Seq.map (fun p -> Cons(bh, p))
+    | Head bh -> yield! find_matching_subexprs a bh |> Seq.map Head
+    | Tail bt -> yield! find_matching_subexprs a bt |> Seq.map Tail
+    | _ -> ()
+  }
+  find_matching_subexprs p0 p1 |> Array.ofSeq  
 
 let find_recurrence p0 p1 =
   let rec enumerate p = seq {
@@ -165,6 +199,20 @@ let find_recurrence p0 p1 =
   |> Seq.filter (fun (p, _) -> p = p1)
   |> Seq.tryHead
 
+let test_recurrence () =
+  let examples =
+    examples2 |> Array.map (fun (a, b) -> parse_old_sexp a, parse_old_sexp b)
+  let traces = examples |> Seq.map (fun (a, b) -> construct_fragment a b)
+  let recurrence_relation =
+    traces
+      |> Seq.pairwise
+      |> Seq.map (fun (a, b) -> find_recurrence2 a b |> Set.ofArray)
+      |> Seq.pairwise
+      |> Seq.collect (fun (x, y) -> Set.intersect x y)
+      |> Seq.tryLast
+    
+  ()
+
 let do_thing () =
   // Calculate the program fragments
   let print ((a, b), predicate, program) =
@@ -184,17 +232,12 @@ let do_thing () =
     Seq.append ps [None]
   let traces = examples |> Seq.map (fun (a, b) -> construct_fragment a b)
   // Return as printed string
-  let v =
-    Seq.zip3 examples predicates traces
-    |> Seq.map print
-    |> String.concat "\n\n"
-  // ################
-  traces
-    |> Seq.pairwise
-    |> Seq.map (fun (a, b) -> find_recurrence a b)
-    |> Array.ofSeq
+  Seq.zip3 examples predicates traces
+  |> Seq.map print
+  |> String.concat "\n\n"
 
 [<EntryPoint>]
 let main argv =
-  let s = do_thing ()
+  //let s = do_thing ()
+  test_recurrence ()
   0 // return an integer exit code
